@@ -1,0 +1,7 @@
+gymnasium==1.4.0
+ale-py==0.12.1
+tyro
+tensorboard
+pandas
+matplotlib
+rliable
