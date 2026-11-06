@@ -1,5 +1,4 @@
 implementation_plan.md
 
 runs/
-src/cleanrl_utils/__pycache__
-src/cleanrl/__pycache__
+__pycache__/

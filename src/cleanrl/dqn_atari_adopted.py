@@ -39,6 +39,8 @@ class Args:
     wandb_entity: str = None                # the entity (team) of wandb's project
     capture_video: bool = False             # whether to capture videos of the agent performances (check out `videos` folder)
     save_model: bool = False                # whether to save model into the `runs/{run_name}` folder
+    checkpoint_frequency: int = 250000      # with --save-model, overwrite the saved weights every this many steps
+    max_hours: float = 0.0                  # stop cleanly after this many hours of training; 0 means no limit
     upload_model: bool = False              # whether to upload the saved model to huggingface
     hf_entity: str = ""                     # the user or org name of the model repository from the Hugging Face Hub
 
@@ -164,6 +166,8 @@ if __name__ == "__main__":
         handle_timeout_termination=False,
     )
     start_time = time.time()
+    # defined save path
+    model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
     
     """
     David notes for loop iteration:
@@ -232,8 +236,14 @@ if __name__ == "__main__":
                 if global_step % 100 == 0:
                     writer.add_scalar("losses/td_loss", loss, global_step)
                     writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
-                    print("SPS:", int(global_step / (time.time() - start_time)))
-                    writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+                    #OG
+                    # print("SPS:", int(global_step / (time.time() - start_time)))
+                    # writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
+                    # less log output
+                    sps = int(global_step / (time.time() - start_time))
+                    writer.add_scalar("charts/SPS", sps, global_step)
+                    if global_step % 10000 == 0:
+                        print("SPS:", sps)
 
                 # optimize the model
                 optimizer.zero_grad()
@@ -246,9 +256,19 @@ if __name__ == "__main__":
                     target_network_param.data.copy_(
                         args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                     )
+                    
+        # save weights during the run so a killed session doesn't lose everything
+        if args.save_model and global_step > 0 and global_step % args.checkpoint_frequency == 0:
+            torch.save(q_network.state_dict(), model_path + ".tmp")
+            os.replace(model_path + ".tmp", model_path)  # a kill mid-save can't damage the last good file
+
+        # stop before the session limit so the final save and eval below still run
+        if args.max_hours > 0 and time.time() - start_time > args.max_hours * 3600:
+            print(f"reached max_hours={args.max_hours} at global_step={global_step}, stopping")
+            break
 
     if args.save_model:
-        model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
+        # model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
         torch.save(q_network.state_dict(), model_path)
         print(f"model saved to {model_path}")
         from cleanrl_utils.evals.dqn_eval import evaluate
@@ -262,6 +282,7 @@ if __name__ == "__main__":
             Model=QNetwork,
             device=device,
             epsilon=args.end_e,
+            capture_video=args.capture_video,       #added by david to stop moviepy crash
         )
         for idx, episodic_return in enumerate(episodic_returns):
             writer.add_scalar("eval/episodic_return", episodic_return, idx)

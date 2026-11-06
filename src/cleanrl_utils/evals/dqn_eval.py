@@ -17,7 +17,11 @@ def evaluate(
     epsilon: float = 0.05,
     capture_video: bool = True,
 ):
-    envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name)])
+    # envs = gym.vector.SyncVectorEnv([make_env(env_id, 0, 0, capture_video, run_name)])
+    envs = gym.vector.SyncVectorEnv(                            # added by david to fix final info disappear issue
+        [make_env(env_id, 0, 0, capture_video, run_name)],
+        autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
+    )
     model = Model(envs).to(device)
     model.load_state_dict(torch.load(model_path, map_location=device))
     model.eval()
@@ -31,12 +35,20 @@ def evaluate(
             q_values = model(torch.Tensor(obs).to(device))
             actions = torch.argmax(q_values, dim=1).cpu().numpy()
         next_obs, _, _, _, infos = envs.step(actions)
-        if "final_info" in infos:
-            for info in infos["final_info"]:
-                if "episode" not in info:
-                    continue
-                print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
-                episodic_returns += [info["episode"]["r"]]
+        # OG
+        # if "final_info" in infos:
+        #     for info in infos["final_info"]:
+        #         if "episode" not in info:
+        #             continue
+        #         print(f"eval_episode={len(episodic_returns)}, episodic_return={info['episode']['r']}")
+        #         episodic_returns += [info["episode"]["r"]]
+        # similar fix as in training for type error
+        if "final_info" in infos and "episode" in infos["final_info"]:
+            final_info = infos["final_info"]
+            for idx in np.flatnonzero(final_info["_episode"]):
+                episodic_return = final_info["episode"]["r"][idx]
+                print(f"eval_episode={len(episodic_returns)}, episodic_return={episodic_return}")
+                episodic_returns.append(episodic_return)
         obs = next_obs
 
     return episodic_returns
