@@ -1,34 +1,28 @@
-# EECE576 controlled Rainbow-style DQN baseline with periodic evaluation.
+# EECE576 CleanRL DQN baseline with periodic evaluation.
 #
-# Configuration represented by this file:
+# Configuration:
 #   (PER, Dueling, Multi-step) = (0, 0, 0)
 #
-# The goal is NOT a bit-for-bit reproduction of the 2015 Nature DQN code.
-# Instead, this file uses one fixed Rainbow-style backbone so that future
-# PER / Dueling / Multi-step variants can be compared fairly while changing
-# only those components.
+# The underlying DQN uses the adopted CleanRL hyperparameters.
+# Training/evaluation budgets are reduced to fit Kaggle compute limits.
 #
-# Key Rainbow-style training settings used here:
+# Current experimental settings:
 #   - 84x84 grayscale observations
 #   - 4 stacked frames
 #   - action repeat 4
 #   - reward clipping during training
-#   - replay capacity 1,000,000
+#   - replay capacity 250,000 transitions
 #   - batch size 32
 #   - gamma 0.99
 #   - learning update every 4 agent steps
-#   - learning starts after 80K ALE frames = 20K agent steps
-#   - hard target update every 32K ALE frames = 8K agent steps
-#   - Adam learning rate 6.25e-5, eps 1.5e-4
-#   - epsilon 1.0 -> 0.01 over 250K ALE frames = 62.5K agent steps
-#   - full budget 200M ALE frames = 50M agent steps
-#   - periodic evaluation every 1M ALE frames = 250K agent steps
-#   - each periodic evaluation lasts 500K ALE frames = 125K agent steps
-#
-# Evaluation epsilon is kept configurable. The Rainbow paper passage that
-# specifies periodic evaluation does not itself state the epsilon, so this
-# file defaults to 0.05 to match the DQN-style evaluation already used in
-# this repository.
+#   - learning starts after 80,000 agent steps
+#   - target network update every 1,000 agent steps
+#   - Adam learning rate 1e-4
+#   - epsilon 1.0 -> 0.01 over first 10% of training
+#   - total training: 5M agent steps ~= 20M ALE frames
+#   - evaluation every 100K agent steps ~= 400K ALE frames
+#   - each evaluation lasts 37.5K agent steps ~= 150K ALE frames
+#   - evaluation epsilon = 0.05
 
 import os
 import random
@@ -83,37 +77,35 @@ class Args:
     max_hours: float = 0.0
 
     # Periodic evaluation
-    eval_frequency: int = 250_000
-    eval_steps: int = 31_250
+    eval_frequency: int = 100_000
+    eval_steps: int = 37_500
     eval_epsilon: float = 0.05
 
     # Environment
     env_id: str = "BreakoutNoFrameskip-v4"
     num_envs: int = 1
 
-    # 200M ALE frames / action-repeat 4 = 50M agent steps
-    total_timesteps: int = 12_500_000
+    # 20M ALE frames / action-repeat 4 = 5M agent steps
+    total_timesteps: int = 5_000_000
 
-    # Rainbow-style common backbone
-    learning_rate: float = 6.25e-5
-    adam_epsilon: float = 1.5e-4
+    # cleanRL common backbone
+    learning_rate: float = 1e-4
     buffer_size: int = 250_000
     gamma: float = 0.99
     batch_size: int = 32
 
     # Hard target-network update:
-    # 32K ALE frames / 4 = 8K agent steps
-    target_network_frequency: int = 8_000
+    target_network_frequency: int = 1_000
     tau: float = 1.0
 
-    # Epsilon-greedy because this project does not include Noisy Nets:
-    # 250K ALE frames / 4 = 62.5K agent steps
+    # CleanRL epsilon schedule: decay over first 10% of total training
+    # For 5M steps, epsilon reaches 0.01 after 500K agent steps
     start_e: float = 1.0
     end_e: float = 0.01
-    epsilon_decay_steps: int = 62_500
+    exploration_fraction: float = 0.10
 
-    # 80K ALE frames / 4 = 20K agent steps
-    learning_starts: int = 20_000
+    # Original CleanRL setting: start learning after 80K agent steps
+    learning_starts: int = 80_000
 
     # One gradient update every 4 agent decisions
     train_frequency: int = 4
@@ -344,11 +336,10 @@ if __name__ == "__main__":
     target_network = QNetwork(envs).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
-    # Rainbow-style optimizer settings.
+    # Optimizer settings.
     optimizer = optim.Adam(
         q_network.parameters(),
-        lr=args.learning_rate,
-        eps=args.adam_epsilon,
+        lr=args.learning_rate
     )
 
     # PER = OFF -> uniform replay.
@@ -386,7 +377,7 @@ if __name__ == "__main__":
         epsilon = linear_schedule(
             args.start_e,
             args.end_e,
-            args.epsilon_decay_steps,
+            args.exploration_fraction * args.total_timesteps,
             global_step,
         )
 
@@ -529,10 +520,16 @@ if __name__ == "__main__":
                         ale_frames,
                     )
 
+                    writer.add_scalar(
+                        "charts/epsilon",
+                        epsilon,
+                        ale_frames,
+                    )
+
                     if agent_step % 10_000 == 0:
                         print("SPS:", sps)
 
-            # Hard target-network update every 8K agent steps
+            # Hard target-network update every 1K agent steps
             # after learning has started.
             steps_since_learning_start = (
                 agent_step - args.learning_starts
