@@ -51,9 +51,9 @@ from cleanrl_utils.atari_wrappers import (
 )
 from cleanrl_utils.buffers import ReplayBuffer
 from collections import deque
+from typing import NamedTuple
 
 FRAME_SKIP = 4
-
 
 @dataclass
 class Args:
@@ -118,6 +118,11 @@ class Args:
     # For multi-step
     n_step: int = 3
 
+    # Prioritized Experience Replay
+    per_alpha: float = 0.5
+    per_beta_start: float = 0.4
+    per_beta_end: float = 1.0
+    per_eps: float = 1e-6
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     """Training environment using DQN/Rainbow Atari preprocessing."""
@@ -146,12 +151,11 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.ResizeObservation(env, (84, 84))
         env = gym.wrappers.GrayscaleObservation(env)
         env = gym.wrappers.FrameStackObservation(env, 4)
-
         env.action_space.seed(seed)
+
         return env
 
     return thunk
-
 
 def make_eval_env(env_id, seed):
     """Evaluation environment for raw full-game scores.
@@ -161,7 +165,6 @@ def make_eval_env(env_id, seed):
     of the whole game. This lets eval/mean_return represent raw game score.
     """
     env = gym.make(env_id)
-
     env = NoopResetEnv(env, noop_max=30)
     env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
 
@@ -174,10 +177,9 @@ def make_eval_env(env_id, seed):
 
     # Outermost wrapper: one recorded evaluation episode = one full game.
     env = gym.wrappers.RecordEpisodeStatistics(env)
-
     env.action_space.seed(seed)
-    return env
 
+    return env
 
 class QNetwork(nn.Module):
     """Standard DQN convolutional network; Dueling is OFF."""
@@ -230,14 +232,145 @@ class DuelingQNetwork(nn.Module):
 
     def forward(self, x):
         features = self.features(x / 255.0)
-
         value = self.value_stream(features)
         advantage = self.advantage_stream(features)
 
-        return value + advantage - advantage.mean(
-            dim=1,
-            keepdim=True,
+        return value + advantage - advantage.mean(dim=1, keepdim=True)
+
+class PrioritizedReplaySamples(NamedTuple):
+    observations: torch.Tensor
+    actions: torch.Tensor
+    next_observations: torch.Tensor
+    dones: torch.Tensor
+    rewards: torch.Tensor
+    indices: np.ndarray
+    weights: torch.Tensor
+
+class SumTree:
+    """Binary sum tree for proportional prioritized replay."""
+
+    def __init__(self, capacity):
+        tree_capacity = 1
+
+        while tree_capacity < capacity:
+            tree_capacity *= 2
+
+        self.capacity = tree_capacity
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+
+    def update(self, index, priority):
+        tree_index = index + self.capacity
+        self.tree[tree_index] = priority
+        tree_index //= 2
+
+        while tree_index >= 1:
+            self.tree[tree_index] = (self.tree[2 * tree_index] + self.tree[2 * tree_index + 1])
+            tree_index //= 2
+
+    def total(self):
+        return self.tree[1]
+
+    def get(self, value):
+        tree_index = 1
+
+        while tree_index < self.capacity:
+            left = 2 * tree_index
+
+            if value < self.tree[left]:
+                tree_index = left
+            else:
+                value -= self.tree[left]
+                tree_index = left + 1
+
+        return tree_index - self.capacity
+
+    def priority(self, index):
+        return self.tree[index + self.capacity]
+
+class PrioritizedReplayBuffer(ReplayBuffer):
+    """Memory-efficient proportional Prioritized Experience Replay."""
+
+    def __init__(self, *args, alpha=0.5, beta=0.4, eps=1e-6, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        self.alpha = alpha
+        self.beta = beta
+        self.eps = eps
+
+        # Store the maximum un-exponentiated priority.
+        self.max_priority = 1.0
+        self.sum_tree = SumTree(self.buffer_size)
+
+    def add(self, obs, next_obs, action, reward, done, infos):
+        # Remember which replay slot is about to be written.
+        insert_index = self.pos
+        super().add(obs, next_obs, action, reward, done, infos,)
+
+        # New experiences receive maximum priority so that
+        # they get sampled at least once.
+        priority = self.max_priority ** self.alpha
+
+        self.sum_tree.update(insert_index, priority)
+
+        # With optimize_memory_usage=True, self.pos is not
+        # currently a valid transition after the buffer is full.
+        if self.optimize_memory_usage and self.full:
+            self.sum_tree.update(self.pos, 0.0)
+
+    def sample(self, batch_size):
+        total_priority = self.sum_tree.total()
+
+        if total_priority <= 0:
+            raise RuntimeError("Cannot sample from an empty prioritized replay buffer.")
+
+        indices = []
+
+        # Divide the priority range into equal sections.
+        # Sample once from each section.
+        segment = total_priority / batch_size
+
+        for i in range(batch_size):
+            low = segment * i
+            high = segment * (i + 1)
+            value = np.random.uniform(low, high)
+            index = self.sum_tree.get(value)
+            indices.append(index)
+
+        indices = np.asarray(indices, dtype=np.int64)
+
+        # Let the existing CleanRL ReplayBuffer retrieve
+        # observations/actions/rewards/etc.
+        data = self._get_samples(indices)
+
+        priorities = np.asarray([self.sum_tree.priority(index) for index in indices], dtype=np.float32)
+        probabilities = priorities / total_priority
+
+        # Importance-sampling correction.
+        weights = (self.size() * probabilities) ** (-self.beta)
+
+        # Normalize so the largest batch weight is 1.
+        weights /= weights.max()
+
+        weights = torch.as_tensor(weights, dtype=torch.float32, device=self.device)
+
+        return PrioritizedReplaySamples(
+            observations=data.observations,
+            actions=data.actions,
+            next_observations=data.next_observations,
+            dones=data.dones,
+            rewards=data.rewards,
+            indices=indices,
+            weights=weights,
         )
+
+    def update_priorities(self, indices,  td_errors):
+        priorities = (np.abs(td_errors) + self.eps)
+
+        self.max_priority = max(self.max_priority, float(priorities.max()))
+
+        for index, priority in zip(indices, priorities):
+            scaled_priority = (float(priority) ** self.alpha)
+            self.sum_tree.update(int(index), scaled_priority)
 
 def get_n_step_transition(n_step_buffer, gamma, n_step):
     """Build one n-step transition from the front of the buffer."""
@@ -259,28 +392,14 @@ def get_n_step_transition(n_step_buffer, gamma, n_step):
         if np.any(terminated) or np.any(truncated):
             break
 
-    return (
-        first_obs,
-        first_action,
-        total_reward,
-        next_obs,
-        done,
-    )
+    return (first_obs, first_action, total_reward, next_obs, done)
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     """Linearly anneal epsilon from start_e to end_e."""
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
 
-
-def evaluate_for_steps(
-    model,
-    env_id,
-    seed,
-    eval_steps,
-    device,
-    epsilon,
-):
+def evaluate_for_steps(model, env_id, seed, eval_steps, device, epsilon):
     """Evaluate the frozen policy for a fixed number of agent steps.
 
     No learning or replay-buffer updates occur here. Returns the raw game
@@ -302,12 +421,7 @@ def evaluate_for_steps(
                 if eval_rng.random() < epsilon:
                     action = env.action_space.sample()
                 else:
-                    obs_tensor = torch.as_tensor(
-                        np.asarray(obs),
-                        dtype=torch.float32,
-                        device=device,
-                    ).unsqueeze(0)
-
+                    obs_tensor = torch.as_tensor(np.asarray(obs), dtype=torch.float32, device=device).unsqueeze(0)
                     q_values = model(obs_tensor)
                     action = int(torch.argmax(q_values, dim=1).item())
 
@@ -316,9 +430,7 @@ def evaluate_for_steps(
 
                 if terminated or truncated:
                     if "episode" in info:
-                        episodic_return = float(
-                            np.asarray(info["episode"]["r"]).item()
-                        )
+                        episodic_return = float(np.asarray(info["episode"]["r"]).item())
                         episodic_returns.append(episodic_return)
 
                     obs, _ = env.reset()
@@ -334,14 +446,7 @@ def evaluate_for_steps(
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
-    if args.use_per:
-        raise NotImplementedError(
-            "PER is not implemented yet."
-        )
-
-    assert args.num_envs == 1, (
-        "This implementation currently supports exactly one training env."
-    )
+    assert args.num_envs == 1, ("This implementation currently supports exactly one training env.")
 
     config_name = (
         f"P{int(args.use_per)}_"
@@ -375,9 +480,7 @@ if __name__ == "__main__":
     writer.add_text(
         "hyperparameters",
         "|param|value|\n|-|-|\n%s"
-        % "\n".join(
-            [f"|{key}|{value}|" for key, value in vars(args).items()]
-        ),
+        % "\n".join([f"|{key}|{value}|" for key, value in vars(args).items()]),
     )
 
     # Reproducibility
@@ -398,23 +501,11 @@ if __name__ == "__main__":
 
     # Training environment
     envs = gym.vector.SyncVectorEnv(
-        [
-            make_env(
-                args.env_id,
-                args.seed + i,
-                i,
-                args.capture_video,
-                run_name,
-            )
-            for i in range(args.num_envs)
-        ],
+        [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name,) for i in range(args.num_envs)],
         autoreset_mode=gym.vector.AutoresetMode.SAME_STEP,
     )
 
-    assert isinstance(
-        envs.single_action_space,
-        gym.spaces.Discrete,
-    ), "Only discrete action spaces are supported."
+    assert isinstance(envs.single_action_space, gym.spaces.Discrete), "Only discrete action spaces are supported."
 
     # ------------------------------------------------------------------
     # (PER, Dueling, Multi-step) = (0, 0, 0)
@@ -432,28 +523,36 @@ if __name__ == "__main__":
     target_network.load_state_dict(q_network.state_dict())
 
     # Optimizer settings.
-    optimizer = optim.Adam(
-        q_network.parameters(),
-        lr=args.learning_rate
-    )
+    optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
 
-    # PER = OFF -> uniform replay.
-    rb = ReplayBuffer(
-        args.buffer_size,
-        envs.single_observation_space,
-        envs.single_action_space,
-        device,
-        optimize_memory_usage=True,
-        handle_timeout_termination=False,
-    )
+    # PER = On/OFF -> PER/uniform replay.
+    if args.use_per:
+        rb = PrioritizedReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            optimize_memory_usage=True,
+            handle_timeout_termination=False,
+            alpha=args.per_alpha,
+            beta=args.per_beta_start,
+            eps=args.per_eps,
+        )
+    else:
+        rb = ReplayBuffer(
+            args.buffer_size,
+            envs.single_observation_space,
+            envs.single_action_space,
+            device,
+            optimize_memory_usage=True,
+            handle_timeout_termination=False,
+        )
 
     start_time = time.time()
 
     model_dir = f"runs/{run_name}"
     model_path = f"{model_dir}/{args.exp_name}.cleanrl_model"
-    best_model_path = (
-        f"{model_dir}/{args.exp_name}.best.cleanrl_model"
-    )
+    best_model_path = f"{model_dir}/{args.exp_name}.best.cleanrl_model"
     best_eval_return = -float("inf")
 
     obs, _ = envs.reset(seed=args.seed)
@@ -464,6 +563,11 @@ if __name__ == "__main__":
         # global_step is zero-based; agent_step is easier to interpret.
         agent_step = global_step + 1
 
+        if args.use_per:
+            progress = global_step / args.total_timesteps
+            rb.beta = (args.per_beta_start + progress * (args.per_beta_end - args.per_beta_start))
+            rb.beta = min(rb.beta, args.per_beta_end,)
+
         # Approximate raw ALE frames, because each selected action is
         # repeated for FRAME_SKIP=4 emulator frames.
         ale_frames = agent_step * FRAME_SKIP
@@ -471,49 +575,21 @@ if __name__ == "__main__":
         # --------------------------------------------------------------
         # Action selection
         # --------------------------------------------------------------
-        epsilon = linear_schedule(
-            args.start_e,
-            args.end_e,
-            args.exploration_fraction * args.total_timesteps,
-            global_step,
-        )
+        epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
 
         if random.random() < epsilon:
-            actions = np.array(
-                [
-                    envs.single_action_space.sample()
-                    for _ in range(envs.num_envs)
-                ]
-            )
+            actions = np.array([envs.single_action_space.sample() for _ in range(envs.num_envs)])
         else:
             with torch.no_grad():
-                q_values = q_network(
-                    torch.as_tensor(
-                        obs,
-                        dtype=torch.float32,
-                        device=device,
-                    )
-                )
-                actions = torch.argmax(
-                    q_values,
-                    dim=1,
-                ).cpu().numpy()
+                q_values = q_network(torch.as_tensor( obs, dtype=torch.float32, device=device))
+                actions = torch.argmax(q_values, dim=1).cpu().numpy()
 
         # One agent decision advances ~4 ALE frames.
-        (
-            next_obs,
-            rewards,
-            terminations,
-            truncations,
-            infos,
-        ) = envs.step(actions)
+        next_obs, rewards, terminations, truncations, infos = envs.step(actions)
 
         # Training return is useful for monitoring, but the main
         # experimental curve is eval/mean_return.
-        if (
-            "final_info" in infos
-            and "episode" in infos["final_info"]
-        ):
+        if "final_info" in infos and "episode" in infos["final_info"]:
             final_info = infos["final_info"]
 
             for idx in np.flatnonzero(final_info["_episode"]):
@@ -526,19 +602,12 @@ if __name__ == "__main__":
                     f"episodic_return={episodic_return}"
                 )
 
-                writer.add_scalar(
-                    "charts/episodic_return",
-                    episodic_return,
-                    ale_frames,
-                )
-                writer.add_scalar(
-                    "charts/episodic_length",
-                    episodic_length,
-                    ale_frames,
-                )
+                writer.add_scalar("charts/episodic_return", episodic_return, ale_frames)
+                writer.add_scalar("charts/episodic_length", episodic_length, ale_frames)
 
         # --------------------------------------------------------------
-        # Uniform replay storage
+        # Replay storage
+        # Uniform or prioritized depending on args.use_per
         # --------------------------------------------------------------
         real_next_obs = next_obs.copy()
 
@@ -547,66 +616,19 @@ if __name__ == "__main__":
                 real_next_obs[idx] = infos["final_obs"][idx]
 
         if args.use_multistep:
-            n_step_buffer.append(
-                (
-                    obs.copy(),
-                    actions.copy(),
-                    rewards.copy(),
-                    real_next_obs.copy(),
-                    terminations.copy(),
-                    truncations.copy(),
-                )
-            )
+            n_step_buffer.append((obs.copy(), actions.copy(), rewards.copy(), real_next_obs.copy(), terminations.copy(), truncations.copy()))
 
             # Once we have n transitions, construct one n-step sample.
             if len(n_step_buffer) >= args.n_step:
-                (
-                    n_obs,
-                    n_action,
-                    n_reward,
-                    n_next_obs,
-                    n_done,
-                ) = get_n_step_transition(
-                    n_step_buffer,
-                    args.gamma,
-                    args.n_step,
-                )
-
-                rb.add(
-                    n_obs,
-                    n_next_obs,
-                    n_action,
-                    n_reward,
-                    n_done,
-                    infos,
-                )
-
+                n_obs, n_action, n_reward, n_next_obs, n_done = get_n_step_transition(n_step_buffer, args.gamma, args.n_step)
+                rb.add(n_obs, n_next_obs, n_action, n_reward, n_done, infos)
                 n_step_buffer.popleft()
 
             # At an episode boundary, flush the remaining transitions.
             if np.any(terminations):
                 while n_step_buffer:
-                    (
-                        n_obs,
-                        n_action,
-                        n_reward,
-                        n_next_obs,
-                        n_done,
-                    ) = get_n_step_transition(
-                        n_step_buffer,
-                        args.gamma,
-                        args.n_step,
-                    )
-
-                    rb.add(
-                        n_obs,
-                        n_next_obs,
-                        n_action,
-                        n_reward,
-                        n_done,
-                        infos,
-                    )
-
+                    n_obs, n_action, n_reward, n_next_obs, n_done = get_n_step_transition(n_step_buffer, args.gamma, args.n_step)
+                    rb.add(n_obs, n_next_obs, n_action, n_reward, n_done, infos)
                     n_step_buffer.popleft()
 
             elif np.any(truncations):
@@ -614,14 +636,7 @@ if __name__ == "__main__":
 
         else:
             # Original 1-step DQN behavior.
-            rb.add(
-                obs,
-                real_next_obs,
-                actions,
-                rewards,
-                terminations,
-                infos,
-            )
+            rb.add(obs, real_next_obs, actions, rewards, terminations, infos)
 
         obs = next_obs
 
@@ -634,9 +649,7 @@ if __name__ == "__main__":
                 data = rb.sample(args.batch_size)
 
                 with torch.no_grad():
-                    target_max, _ = target_network(
-                        data.next_observations
-                    ).max(dim=1)
+                    target_max, _ = target_network(data.next_observations).max(dim=1)
 
                     # n-step TD target:
                     if args.use_multistep:
@@ -644,89 +657,47 @@ if __name__ == "__main__":
                     else:
                         bootstrap_gamma = args.gamma
 
-                    td_target = (
-                        data.rewards.flatten()
-                        + bootstrap_gamma
-                        * target_max
-                        * (1 - data.dones.flatten())
-                    )
+                    td_target = (data.rewards.flatten() + bootstrap_gamma * target_max * (1 - data.dones.flatten()))
 
-                old_val = q_network(
-                    data.observations
-                ).gather(
-                    1,
-                    data.actions,
-                ).squeeze()
+                old_val = q_network(data.observations).gather(1, data.actions,).squeeze()
+                td_error = td_target - old_val
 
-                loss = F.mse_loss(
-                    td_target,
-                    old_val,
-                )
+                if args.use_per:
+                    loss = (data.weights * td_error.pow(2)).mean()
+                    rb.update_priorities(data.indices, td_error.detach().cpu().numpy())
+
+                else:
+                    loss = F.mse_loss(td_target, old_val)
 
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
                 if agent_step % 100 == 0:
-                    writer.add_scalar(
-                        "losses/td_loss",
-                        loss.item(),
-                        ale_frames,
-                    )
-                    writer.add_scalar(
-                        "losses/q_values",
-                        old_val.mean().item(),
-                        ale_frames,
-                    )
+                    writer.add_scalar("losses/td_loss", loss.item(), ale_frames)
+                    writer.add_scalar("losses/q_values", old_val.mean().item(), ale_frames)
+                    sps = int(agent_step / (time.time() - start_time))
+                    writer.add_scalar("charts/SPS", sps, ale_frames)
+                    writer.add_scalar("charts/epsilon", epsilon, ale_frames)
 
-                    sps = int(
-                        agent_step / (time.time() - start_time)
-                    )
-
-                    writer.add_scalar(
-                        "charts/SPS",
-                        sps,
-                        ale_frames,
-                    )
-
-                    writer.add_scalar(
-                        "charts/epsilon",
-                        epsilon,
-                        ale_frames,
-                    )
+                    if args.use_per:
+                        writer.add_scalar("charts/per_beta", rb.beta, ale_frames)
 
                     if agent_step % 10_000 == 0:
                         print("SPS:", sps)
 
             # Hard target-network update every 1K agent steps
             # after learning has started.
-            steps_since_learning_start = (
-                agent_step - args.learning_starts
-            )
+            steps_since_learning_start = ( agent_step - args.learning_starts)
 
-            if (
-                steps_since_learning_start > 0
-                and steps_since_learning_start
-                % args.target_network_frequency
-                == 0
-            ):
-                for target_param, online_param in zip(
-                    target_network.parameters(),
-                    q_network.parameters(),
-                ):
-                    target_param.data.copy_(
-                        args.tau * online_param.data
-                        + (1.0 - args.tau)
-                        * target_param.data
-                    )
+            if (steps_since_learning_start > 0 and steps_since_learning_start % args.target_network_frequency == 0):
+                for target_param, online_param in zip(target_network.parameters(), q_network.parameters()):
+                    target_param.data.copy_(args.tau * online_param.data + (1.0 - args.tau) * target_param.data)
 
         # --------------------------------------------------------------
         # Periodic evaluation
         # --------------------------------------------------------------
-        if (
-            args.eval_frequency > 0
-            and agent_step % args.eval_frequency == 0
-        ):
+        if (args.eval_frequency > 0 and agent_step % args.eval_frequency == 0):
             eval_returns = evaluate_for_steps(
                 model=q_network,
                 env_id=args.env_id,
@@ -737,12 +708,8 @@ if __name__ == "__main__":
             )
 
             if eval_returns:
-                mean_eval_return = float(
-                    np.mean(eval_returns)
-                )
-                std_eval_return = float(
-                    np.std(eval_returns)
-                )
+                mean_eval_return = float(np.mean(eval_returns))
+                std_eval_return = float(np.std(eval_returns))
 
                 print(
                     f"[EVAL] agent_step={agent_step}, "
@@ -752,37 +719,15 @@ if __name__ == "__main__":
                     f"std_return={std_eval_return:.3f}"
                 )
 
-                writer.add_scalar(
-                    "eval/mean_return",
-                    mean_eval_return,
-                    ale_frames,
-                )
-                writer.add_scalar(
-                    "eval/std_return",
-                    std_eval_return,
-                    ale_frames,
-                )
-                writer.add_scalar(
-                    "eval/episodes_completed",
-                    len(eval_returns),
-                    ale_frames,
-                )
+                writer.add_scalar("eval/mean_return", mean_eval_return, ale_frames)
+                writer.add_scalar("eval/std_return", std_eval_return, ale_frames)
+                writer.add_scalar("eval/episodes_completed", len(eval_returns), ale_frames)
                 writer.flush()
 
-                if (
-                    args.save_model
-                    and mean_eval_return > best_eval_return
-                ):
+                if (args.save_model and mean_eval_return > best_eval_return):
                     best_eval_return = mean_eval_return
-
-                    torch.save(
-                        q_network.state_dict(),
-                        best_model_path + ".tmp",
-                    )
-                    os.replace(
-                        best_model_path + ".tmp",
-                        best_model_path,
-                    )
+                    torch.save( q_network.state_dict(), best_model_path + ".tmp")
+                    os.replace(best_model_path + ".tmp", best_model_path)
 
                     print(
                         "[EVAL] new best evaluated model saved to "
@@ -798,27 +743,14 @@ if __name__ == "__main__":
         # --------------------------------------------------------------
         # Periodic checkpoint
         # --------------------------------------------------------------
-        if (
-            args.save_model
-            and agent_step % args.checkpoint_frequency == 0
-        ):
-            torch.save(
-                q_network.state_dict(),
-                model_path + ".tmp",
-            )
-            os.replace(
-                model_path + ".tmp",
-                model_path,
-            )
+        if args.save_model and agent_step % args.checkpoint_frequency == 0:
+            torch.save(q_network.state_dict(), model_path + ".tmp")
+            os.replace(model_path + ".tmp", model_path)
 
         # --------------------------------------------------------------
         # Optional session time limit
         # --------------------------------------------------------------
-        if (
-            args.max_hours > 0
-            and time.time() - start_time
-            > args.max_hours * 3600
-        ):
+        if args.max_hours > 0 and time.time() - start_time > args.max_hours * 3600:
             print(
                 f"reached max_hours={args.max_hours} "
                 f"at agent_step={agent_step}, "
@@ -827,10 +759,7 @@ if __name__ == "__main__":
             break
 
     if args.save_model:
-        torch.save(
-            q_network.state_dict(),
-            model_path,
-        )
+        torch.save(q_network.state_dict(), model_path)
         print(f"latest model saved to {model_path}")
 
         if os.path.exists(best_model_path):
