@@ -50,7 +50,7 @@ from cleanrl_utils.atari_wrappers import (
     NoopResetEnv,
 )
 from cleanrl_utils.buffers import ReplayBuffer
-
+from collections import deque
 
 FRAME_SKIP = 4
 
@@ -114,6 +114,9 @@ class Args:
     use_per: bool = False
     use_dueling: bool = False
     use_multistep: bool = False
+
+    # For multi-step
+    n_step: int = 3
 
 
 def make_env(env_id, seed, idx, capture_video, run_name):
@@ -236,6 +239,33 @@ class DuelingQNetwork(nn.Module):
             keepdim=True,
         )
 
+def get_n_step_transition(n_step_buffer, gamma, n_step):
+    """Build one n-step transition from the front of the buffer."""
+
+    first_obs, first_action, _, _, _, _ = n_step_buffer[0]
+
+    total_reward = np.zeros_like(n_step_buffer[0][2])
+    next_obs = n_step_buffer[0][3]
+    done = n_step_buffer[0][4]
+
+    for i, transition in enumerate(list(n_step_buffer)[:n_step]):
+        _, _, reward, transition_next_obs, terminated, truncated = transition
+
+        total_reward += (gamma ** i) * reward
+        next_obs = transition_next_obs
+        done = terminated
+
+        # Do not let an n-step transition cross an episode boundary.
+        if np.any(terminated) or np.any(truncated):
+            break
+
+    return (
+        first_obs,
+        first_action,
+        total_reward,
+        next_obs,
+        done,
+    )
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     """Linearly anneal epsilon from start_e to end_e."""
@@ -307,11 +337,6 @@ if __name__ == "__main__":
     if args.use_per:
         raise NotImplementedError(
             "PER is not implemented yet."
-        )
-
-    if args.use_multistep:
-        raise NotImplementedError(
-            "Multi-step is not implemented yet."
         )
 
     assert args.num_envs == 1, (
@@ -433,6 +458,8 @@ if __name__ == "__main__":
 
     obs, _ = envs.reset(seed=args.seed)
 
+    n_step_buffer = deque()
+
     for global_step in range(args.total_timesteps):
         # global_step is zero-based; agent_step is easier to interpret.
         agent_step = global_step + 1
@@ -519,20 +546,88 @@ if __name__ == "__main__":
             if trunc:
                 real_next_obs[idx] = infos["final_obs"][idx]
 
-        rb.add(
-            obs,
-            real_next_obs,
-            actions,
-            rewards,
-            terminations,
-            infos,
-        )
+        if args.use_multistep:
+            n_step_buffer.append(
+                (
+                    obs.copy(),
+                    actions.copy(),
+                    rewards.copy(),
+                    real_next_obs.copy(),
+                    terminations.copy(),
+                    truncations.copy(),
+                )
+            )
+
+            # Once we have n transitions, construct one n-step sample.
+            if len(n_step_buffer) >= args.n_step:
+                (
+                    n_obs,
+                    n_action,
+                    n_reward,
+                    n_next_obs,
+                    n_done,
+                ) = get_n_step_transition(
+                    n_step_buffer,
+                    args.gamma,
+                    args.n_step,
+                )
+
+                rb.add(
+                    n_obs,
+                    n_next_obs,
+                    n_action,
+                    n_reward,
+                    n_done,
+                    infos,
+                )
+
+                n_step_buffer.popleft()
+
+            # At an episode boundary, flush the remaining transitions.
+            if np.any(terminations):
+                while n_step_buffer:
+                    (
+                        n_obs,
+                        n_action,
+                        n_reward,
+                        n_next_obs,
+                        n_done,
+                    ) = get_n_step_transition(
+                        n_step_buffer,
+                        args.gamma,
+                        args.n_step,
+                    )
+
+                    rb.add(
+                        n_obs,
+                        n_next_obs,
+                        n_action,
+                        n_reward,
+                        n_done,
+                        infos,
+                    )
+
+                    n_step_buffer.popleft()
+
+            elif np.any(truncations):
+                n_step_buffer.clear()
+
+        else:
+            # Original 1-step DQN behavior.
+            rb.add(
+                obs,
+                real_next_obs,
+                actions,
+                rewards,
+                terminations,
+                infos,
+            )
 
         obs = next_obs
 
         # --------------------------------------------------------------
-        # Plain 1-step DQN update
-        # Multi-step = OFF
+        # 1-step or n-step DQN update
+        # Multi-step controlled by args.use_multistep
         # --------------------------------------------------------------
         if agent_step > args.learning_starts:
             if agent_step % args.train_frequency == 0:
@@ -543,11 +638,15 @@ if __name__ == "__main__":
                         data.next_observations
                     ).max(dim=1)
 
-                    # One-step TD target:
-                    # r_t + gamma * max_a Q_target(s_{t+1}, a)
+                    # n-step TD target:
+                    if args.use_multistep:
+                        bootstrap_gamma = args.gamma ** args.n_step
+                    else:
+                        bootstrap_gamma = args.gamma
+
                     td_target = (
                         data.rewards.flatten()
-                        + args.gamma
+                        + bootstrap_gamma
                         * target_max
                         * (1 - data.dones.flatten())
                     )
