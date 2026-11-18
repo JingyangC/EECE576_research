@@ -110,6 +110,11 @@ class Args:
     # One gradient update every 4 agent decisions
     train_frequency: int = 4
 
+    # Rainbow components used in the factorial ablation
+    use_per: bool = False
+    use_dueling: bool = False
+    use_multistep: bool = False
+
 
 def make_env(env_id, seed, idx, capture_video, run_name):
     """Training environment using DQN/Rainbow Atari preprocessing."""
@@ -192,6 +197,45 @@ class QNetwork(nn.Module):
     def forward(self, x):
         return self.network(x / 255.0)
 
+class DuelingQNetwork(nn.Module):
+    """Dueling DQN convolutional network based on CleanRL Rainbow Algorithm; Dueling is ON."""
+
+    def __init__(self, env):
+        super().__init__()
+
+        self.features = nn.Sequential(
+            nn.Conv2d(4, 32, 8, stride=4),
+            nn.ReLU(),
+            nn.Conv2d(32, 64, 4, stride=2),
+            nn.ReLU(),
+            nn.Conv2d(64, 64, 3, stride=1),
+            nn.ReLU(),
+            nn.Flatten(),
+        )
+
+        self.value_stream = nn.Sequential(
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, 1),
+        )
+
+        self.advantage_stream = nn.Sequential(
+            nn.Linear(3136, 512),
+            nn.ReLU(),
+            nn.Linear(512, env.single_action_space.n),
+        )
+
+    def forward(self, x):
+        features = self.features(x / 255.0)
+
+        value = self.value_stream(features)
+        advantage = self.advantage_stream(features)
+
+        return value + advantage - advantage.mean(
+            dim=1,
+            keepdim=True,
+        )
+
 
 def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     """Linearly anneal epsilon from start_e to end_e."""
@@ -260,13 +304,33 @@ def evaluate_for_steps(
 if __name__ == "__main__":
     args = tyro.cli(Args)
 
+    if args.use_per:
+        raise NotImplementedError(
+            "PER is not implemented yet."
+        )
+
+    if args.use_multistep:
+        raise NotImplementedError(
+            "Multi-step is not implemented yet."
+        )
+
     assert args.num_envs == 1, (
         "This implementation currently supports exactly one training env."
     )
 
+    config_name = (
+        f"P{int(args.use_per)}_"
+        f"D{int(args.use_dueling)}_"
+        f"M{int(args.use_multistep)}"
+    )
+
+    print(f"Configuration: {config_name}")
+
     run_name = (
-        f"{args.env_id}__{args.exp_name}__"
-        f"{args.seed}__{int(time.time())}"
+        f"{args.env_id}__"
+        f"{config_name}__"
+        f"seed{args.seed}__"
+        f"{int(time.time())}"
     )
 
     if args.track:
@@ -331,9 +395,15 @@ if __name__ == "__main__":
     # (PER, Dueling, Multi-step) = (0, 0, 0)
     # ------------------------------------------------------------------
 
-    # Dueling = OFF
-    q_network = QNetwork(envs).to(device)
-    target_network = QNetwork(envs).to(device)
+    # Dueling = ON/OFF
+    NetworkClass = (
+        DuelingQNetwork
+        if args.use_dueling
+        else QNetwork
+    )
+
+    q_network = NetworkClass(envs).to(device)
+    target_network = NetworkClass(envs).to(device)
     target_network.load_state_dict(q_network.state_dict())
 
     # Optimizer settings.
