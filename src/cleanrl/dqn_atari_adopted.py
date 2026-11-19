@@ -25,6 +25,8 @@ from cleanrl_utils.atari_wrappers import (
 )
 from cleanrl_utils.buffers import ReplayBuffer
 
+FRAME_SKIP = 4  # each agent step = 4 ALE frames; plots use ALE frames on the x-axis
+
 
 @dataclass
 class Args:
@@ -44,12 +46,17 @@ class Args:
     upload_model: bool = False              # whether to upload the saved model to huggingface
     hf_entity: str = ""                     # the user or org name of the model repository from the Hugging Face Hub
 
+    # Periodic evaluation (same settings as dqn_atari_periodic_eval.py)
+    eval_frequency: int = 100000           # evaluate every this many agent steps; 0 disables
+    eval_steps: int = 37500                # agent steps per evaluation (= 150K ALE frames)
+    eval_epsilon: float = 0.05              # epsilon-greedy during evaluation
+
     # Algorithm specific arguments
     env_id: str = "BreakoutNoFrameskip-v4"  # the id of the environment
-    total_timesteps: int = 10000000         # total timesteps of the experiments
+    total_timesteps: int = 5000000         # total timesteps of the experiments
     learning_rate: float = 1e-4             # the learning rate of the optimizer
     num_envs: int = 1                       # the number of parallel game environments
-    buffer_size: int = 1000000              # the replay memory buffer size
+    buffer_size: int = 250000              # the replay memory buffer size
     gamma: float = 0.99                     # the discount factor gamma
     tau: float = 1.0                        # the target network update rate
     target_network_frequency: int = 1000    # the timesteps it takes to update the target network
@@ -71,7 +78,7 @@ def make_env(env_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.RecordEpisodeStatistics(env)
 
         env = NoopResetEnv(env, noop_max=30)
-        env = MaxAndSkipEnv(env, skip=4)
+        env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
         env = EpisodicLifeEnv(env)
         if "FIRE" in env.unwrapped.get_action_meanings():
             env = FireResetEnv(env)
@@ -112,6 +119,56 @@ def linear_schedule(start_e: float, end_e: float, duration: int, t: int):
     slope = (end_e - start_e) / duration
     return max(slope * t + start_e, end_e)
 
+
+def evaluate_for_steps(model, env_id, seed, eval_steps, device, epsilon,):
+    """Evaluate the frozen policy for a fixed number of agent steps.
+
+    No learning or replay-buffer updates occur here. Returns the raw game
+    scores of complete games that finish within the evaluation window.
+    """
+    env = make_env(env_id, seed, 0, False, "eval")()
+    obs, _ = env.reset(seed=seed)
+
+    # Dedicated RNG so evaluation does not perturb the training Python RNG.
+    eval_rng = random.Random(seed)
+
+    episodic_returns = []
+    was_training = model.training
+    model.eval()
+
+    try:
+        with torch.no_grad():
+            for _ in range(eval_steps):
+                if eval_rng.random() < epsilon:
+                    action = env.action_space.sample()
+                else:
+                    obs_tensor = torch.as_tensor(
+                        np.asarray(obs),
+                        dtype=torch.float32,
+                        device=device,
+                    ).unsqueeze(0)
+
+                    q_values = model(obs_tensor)
+                    action = int(torch.argmax(q_values, dim=1).item())
+
+                next_obs, _, terminated, truncated, info = env.step(action)
+                obs = next_obs
+
+                if terminated or truncated:
+                    if "episode" in info:
+                        episodic_return = float(
+                            np.asarray(info["episode"]["r"]).item()
+                        )
+                        episodic_returns.append(episodic_return)
+
+                    obs, _ = env.reset()
+    finally:
+        env.close()
+
+        if was_training:
+            model.train()
+
+    return episodic_returns
 
 if __name__ == "__main__":
     args = tyro.cli(Args)
@@ -168,7 +225,9 @@ if __name__ == "__main__":
     start_time = time.time()
     # defined save path
     model_path = f"runs/{run_name}/{args.exp_name}.cleanrl_model"
-    
+    best_model_path = f"runs/{run_name}/{args.exp_name}.best.cleanrl_model"
+    best_eval_return = -float("inf")
+
     """
     David notes for loop iteration:
     1. Calculate epsilon for greedy
@@ -184,6 +243,10 @@ if __name__ == "__main__":
     # TRY NOT TO MODIFY: start the game
     obs, _ = envs.reset(seed=args.seed)
     for global_step in range(args.total_timesteps):
+        # For logging/eval only, matching dqn_atari_periodic_eval.py. Training logic below still uses global_step.
+        agent_step = global_step + 1
+        ale_frames = agent_step * FRAME_SKIP
+
         # ALGO LOGIC: put action logic here
         epsilon = linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
         if random.random() < epsilon:
@@ -206,9 +269,9 @@ if __name__ == "__main__":
         if "final_info" in infos and "episode" in infos["final_info"]:
             final_info = infos["final_info"]
             for idx in np.flatnonzero(final_info["_episode"]):
-                print(f"global_step={global_step}, episodic_return={final_info['episode']['r'][idx]}")
-                writer.add_scalar("charts/episodic_return", final_info["episode"]["r"][idx], global_step)
-                writer.add_scalar("charts/episodic_length", final_info["episode"]["l"][idx], global_step)
+                print(f"agent_step={agent_step}, ale_frames={ale_frames}, episodic_return={final_info['episode']['r'][idx]}")
+                writer.add_scalar("charts/episodic_return", final_info["episode"]["r"][idx], ale_frames)
+                writer.add_scalar("charts/episodic_length", final_info["episode"]["l"][idx], ale_frames)
 
 
         # TRY NOT TO MODIFY: save data to reply buffer; handle `final_observation`
@@ -234,14 +297,15 @@ if __name__ == "__main__":
                 loss = F.mse_loss(td_target, old_val)
 
                 if global_step % 100 == 0:
-                    writer.add_scalar("losses/td_loss", loss, global_step)
-                    writer.add_scalar("losses/q_values", old_val.mean().item(), global_step)
+                    writer.add_scalar("losses/td_loss", loss.item(), ale_frames)
+                    writer.add_scalar("losses/q_values", old_val.mean().item(), ale_frames)
                     #OG
                     # print("SPS:", int(global_step / (time.time() - start_time)))
                     # writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                     # less log output
-                    sps = int(global_step / (time.time() - start_time))
-                    writer.add_scalar("charts/SPS", sps, global_step)
+                    sps = int(agent_step / (time.time() - start_time))  # includes time spent in evaluation
+                    writer.add_scalar("charts/SPS", sps, ale_frames)
+                    writer.add_scalar("charts/epsilon", epsilon, ale_frames)
                     if global_step % 10000 == 0:
                         print("SPS:", sps)
 
@@ -256,7 +320,33 @@ if __name__ == "__main__":
                     target_network_param.data.copy_(
                         args.tau * q_network_param.data + (1.0 - args.tau) * target_network_param.data
                     )
-                    
+
+        # periodic evaluation: pause learning, play eval_steps with the current network, log the mean game score
+        if args.eval_frequency > 0 and agent_step % args.eval_frequency == 0:
+            eval_returns = evaluate_for_steps(
+                q_network, args.env_id, args.seed + 10_000, args.eval_steps, device, args.eval_epsilon
+            )
+            if eval_returns:
+                mean_eval_return = float(np.mean(eval_returns))
+                std_eval_return = float(np.std(eval_returns))
+                print(
+                    f"[EVAL] agent_step={agent_step}, ale_frames={ale_frames}, episodes={len(eval_returns)}, "
+                    f"mean_return={mean_eval_return:.3f}, std_return={std_eval_return:.3f}"
+                )
+                writer.add_scalar("eval/mean_return", mean_eval_return, ale_frames)
+                writer.add_scalar("eval/std_return", std_eval_return, ale_frames)
+                writer.add_scalar("eval/episodes_completed", len(eval_returns), ale_frames)
+                writer.flush()
+
+                # keep the best-evaluated weights too
+                if args.save_model and mean_eval_return > best_eval_return:
+                    best_eval_return = mean_eval_return
+                    torch.save(q_network.state_dict(), best_model_path + ".tmp")
+                    os.replace(best_model_path + ".tmp", best_model_path)
+                    print(f"[EVAL] new best evaluated model saved to {best_model_path}")
+            else:
+                print(f"[EVAL] agent_step={agent_step}: no complete games finished in the evaluation window")
+
         # save weights during the run so a killed session doesn't lose everything
         if args.save_model and global_step > 0 and global_step % args.checkpoint_frequency == 0:
             torch.save(q_network.state_dict(), model_path + ".tmp")
