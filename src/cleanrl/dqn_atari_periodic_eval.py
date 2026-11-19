@@ -11,7 +11,7 @@
 #   - 4 stacked frames
 #   - action repeat 4
 #   - reward clipping during training
-#   - replay capacity 250,000 transitions
+#   - replay capacity 250,000 transitions (obs and next_obs stored separately, ~14 GB)
 #   - batch size 32
 #   - gamma 0.99
 #   - learning update every 4 agent steps
@@ -157,30 +157,6 @@ def make_env(env_id, seed, idx, capture_video, run_name):
 
     return thunk
 
-def make_eval_env(env_id, seed):
-    """Evaluation environment for raw full-game scores.
-
-    Evaluation keeps the same observation preprocessing and action repeat,
-    but it does NOT clip rewards and it does NOT treat a lost life as the end
-    of the whole game. This lets eval/mean_return represent raw game score.
-    """
-    env = gym.make(env_id)
-    env = NoopResetEnv(env, noop_max=30)
-    env = MaxAndSkipEnv(env, skip=FRAME_SKIP)
-
-    if "FIRE" in env.unwrapped.get_action_meanings():
-        env = FireResetEnv(env)
-
-    env = gym.wrappers.ResizeObservation(env, (84, 84))
-    env = gym.wrappers.GrayscaleObservation(env)
-    env = gym.wrappers.FrameStackObservation(env, 4)
-
-    # Outermost wrapper: one recorded evaluation episode = one full game.
-    env = gym.wrappers.RecordEpisodeStatistics(env)
-    env.action_space.seed(seed)
-
-    return env
-
 class QNetwork(nn.Module):
     """Standard DQN convolutional network; Dueling is OFF."""
 
@@ -256,7 +232,8 @@ class SumTree:
             tree_capacity *= 2
 
         self.capacity = tree_capacity
-        self.tree = np.zeros(2 * self.capacity, dtype=np.float32)
+        # float64 keeps rounding in the parent sums far smaller than float32.
+        self.tree = np.zeros(2 * self.capacity, dtype=np.float64)
 
     def update(self, index, priority):
         tree_index = index + self.capacity
@@ -271,16 +248,27 @@ class SumTree:
         return self.tree[1]
 
     def get(self, value):
+        """Return the leaf index whose cumulative-priority range contains value.
+
+        A parent's stored sum can be rounded slightly above the true sum of
+        its children. A value falling in that gap would walk right into a
+        subtree whose remaining leaves may all be empty (priority 0), e.g. an
+        unfilled slot or the padding beyond buffer_size. That gives either an
+        out-of-range index or a probability-0 sample with an infinite IS weight
+        (-> NaN loss). Never stepping into a child whose sum is 0 guarantees
+        the walk always ends on a leaf with priority > 0.
+        """
         tree_index = 1
 
         while tree_index < self.capacity:
             left = 2 * tree_index
+            right = left + 1
 
-            if value < self.tree[left]:
+            if value < self.tree[left] or self.tree[right] <= 0.0:
                 tree_index = left
             else:
                 value -= self.tree[left]
-                tree_index = left + 1
+                tree_index = right
 
         return tree_index - self.capacity
 
@@ -404,8 +392,15 @@ def evaluate_for_steps(model, env_id, seed, eval_steps, device, epsilon):
 
     No learning or replay-buffer updates occur here. Returns the raw game
     scores of complete games that finish within the evaluation window.
+
+    The evaluation env is a separate instance built with the SAME wrappers as
+    training, so the agent sees exactly the inputs it was trained on (lost life
+    -> soft reset + automatic FIRE). Scores are still raw full-game scores:
+    RecordEpisodeStatistics is the innermost wrapper, so it sits below
+    ClipRewardEnv and EpisodicLifeEnv and only reports info["episode"] when the
+    real game ends (all lives lost, or the 108K-frame ALE cap is reached).
     """
-    env = make_eval_env(env_id, seed)
+    env = make_env(env_id, seed, idx=0, capture_video=False, run_name="eval")()
     obs, _ = env.reset(seed=seed)
 
     # Dedicated RNG so evaluation does not perturb the training Python RNG.
@@ -526,13 +521,21 @@ if __name__ == "__main__":
     optimizer = optim.Adam(q_network.parameters(), lr=args.learning_rate)
 
     # PER = On/OFF -> PER/uniform replay.
+    #
+    # optimize_memory_usage must be False. The memory-optimized buffer does not
+    # store next_obs separately: it writes it into the NEXT slot and reads it
+    # back as observations[idx + 1]. That only holds for 1-step transitions.
+    # An n-step transition (s_t, a_t, R_t^(n), s_{t+n}) would have its s_{t+n}
+    # overwritten by s_{t+1} on the next add, so the target would bootstrap
+    # from the wrong state. Using the same setting for every configuration
+    # keeps the ablation fair. Cost: ~14 GB RAM for 250K transitions.
     if args.use_per:
         rb = PrioritizedReplayBuffer(
             args.buffer_size,
             envs.single_observation_space,
             envs.single_action_space,
             device,
-            optimize_memory_usage=True,
+            optimize_memory_usage=False,
             handle_timeout_termination=False,
             alpha=args.per_alpha,
             beta=args.per_beta_start,
@@ -544,7 +547,7 @@ if __name__ == "__main__":
             envs.single_observation_space,
             envs.single_action_space,
             device,
-            optimize_memory_usage=True,
+            optimize_memory_usage=False,
             handle_timeout_termination=False,
         )
 
@@ -632,6 +635,15 @@ if __name__ == "__main__":
                     n_step_buffer.popleft()
 
             elif np.any(truncations):
+                # Time-limit truncation (108K-frame ALE cap): deliberately
+                # discard the remaining n-1 transitions instead of flushing
+                # them. They only have k < n rewards before the cutoff, so
+                # their correct bootstrap discount would be gamma**k, but the
+                # update uses a fixed gamma**n for every non-terminal sample.
+                # Dropping them keeps every stored target correct; the cost is
+                # n-1 transitions per truncated game (~0.007% of its data).
+                # The transition starting n steps back was already stored
+                # above with a full n-step return bootstrapping from final_obs.
                 n_step_buffer.clear()
 
         else:
