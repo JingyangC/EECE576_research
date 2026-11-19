@@ -7,6 +7,7 @@
 # Training/evaluation budgets are reduced to fit Kaggle compute limits.
 #
 # Current experimental settings:
+#   - game: FrostbiteNoFrameskip-v4 (override with --env-id)
 #   - 84x84 grayscale observations
 #   - 4 stacked frames
 #   - action repeat 4
@@ -82,7 +83,10 @@ class Args:
     eval_epsilon: float = 0.05
 
     # Environment
-    env_id: str = "BreakoutNoFrameskip-v4"
+    # Frostbite: large DQN -> Rainbow gap that appears early in training, and
+    # removing PER or multi-step clearly hurts Rainbow there (Hessel et al.
+    # 2018, Table 6 / Figs. 4-5). Breakout showed almost no difference.
+    env_id: str = "FrostbiteNoFrameskip-v4"
     num_envs: int = 1
 
     # 20M ALE frames / action-repeat 4 = 5M agent steps
